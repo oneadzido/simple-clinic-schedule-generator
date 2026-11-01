@@ -1,0 +1,466 @@
+# ============================================================================
+# SCSG — Simple Clinic Schedule Generator
+# Release Workflow (Developer Release Only)
+# ----------------------------------------------------------------------------
+# File    : .github/workflows/main.yml
+# Version : 1.1.0
+#
+# AUTHOR  : Richard Korbla Adzido
+# LICENSE : MIT (see LICENSE inside the source archive)
+#
+# This is the ONLY release chain for SCSG. It is self-verifying:
+#   - version auto-detected from the archive (input > tag > scsg.html > CHANGELOG.md)
+#   - version consistency enforced across scsg.html, CHANGELOG.md and the target
+#   - developer archive built deterministically (SOURCE_DATE_EPOCH, zip -X)
+#   - SHA256 published alongside the archive
+#   - duplicate releases refused on tag push; allowed (with warning) on dispatch
+#
+# Runtime: all actions pinned to Node.js 24-compatible majors
+#   - actions/checkout@v6            (Node 24)
+#   - actions/upload-artifact@v6     (Node 24)
+#   - softprops/action-gh-release@v3 (Node 24)
+# ============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional: version override (e.g. v1.1.0). Leave empty to auto-detect from the archive.'
+        required: false
+        type: string
+        default: ''
+      archive:
+        description: 'Optional: explicit path to the source ZIP in the repo root.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+# One release per version at a time. Never cancel — queue.
+concurrency:
+  group: release-${{ github.ref }}-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Extract archive, build, publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      # ----------------------------------------------------------------
+      # 1. Locate the source ZIP
+      # ----------------------------------------------------------------
+      - name: Locate source archive
+        id: locate
+        env:
+          INPUT_ARCHIVE: ${{ github.event.inputs.archive }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -e
+          CANDIDATE="${INPUT_ARCHIVE:-}"
+
+          if [ -n "$CANDIDATE" ] && [[ "$CANDIDATE" == *".."* ]]; then
+            echo "::error::Archive path must not contain '..': $CANDIDATE"
+            exit 1
+          fi
+
+          if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+            ZIP="$CANDIDATE"
+          elif [ -f "${REPO_NAME}.zip" ]; then
+            ZIP="${REPO_NAME}.zip"
+          else
+            ZIP=$(find . -maxdepth 1 -name '*.zip' -type f | head -n 1)
+          fi
+
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error::No source ZIP found in repository root."
+            exit 1
+          fi
+
+          echo "archive=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "Using source archive: $ZIP"
+
+      # ----------------------------------------------------------------
+      # 2. Extract and locate project root
+      # ----------------------------------------------------------------
+      - name: Extract source archive and locate project root
+        id: extract
+        env:
+          ZIP: ${{ steps.locate.outputs.archive }}
+        run: |
+          set -e
+          rm -rf work dist
+          mkdir -p work
+
+          unzip -q "$ZIP" -d work
+          chmod -R u+rwX work || true
+
+          rm -rf work/__MACOSX 2>/dev/null || true
+          find work -type f -name '.DS_Store'   -delete 2>/dev/null || true
+          find work -type f -name 'Thumbs.db'   -delete 2>/dev/null || true
+
+          FOUND=$(find work -type f -name 'scsg.html' 2>/dev/null | head -n 1)
+          if [ -z "$FOUND" ]; then
+            echo "::error::scsg.html not found inside the archive."
+            exit 1
+          fi
+
+          ROOT=$(dirname "$FOUND")
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected project root: $ROOT"
+
+      # ----------------------------------------------------------------
+      # 3. Resolve version (input > tag > scsg.html > CHANGELOG.md > fail)
+      # ----------------------------------------------------------------
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TAG_REF: ${{ github.ref }}
+          ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          set -e
+          VERSION=""
+          SOURCE=""
+
+          # Priority 1 — explicit dispatch input
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+            SOURCE="workflow_dispatch input"
+          fi
+
+          # Priority 2 — git tag ref (push trigger)
+          if [ -z "$VERSION" ] && [[ "$TAG_REF" == refs/tags/* ]]; then
+            VERSION="${TAG_REF#refs/tags/}"
+            SOURCE="git tag"
+          fi
+
+          # Priority 3 — <meta name="version"> in scsg.html (runtime source of truth)
+          if [ -z "$VERSION" ] && [ -f "$ROOT/scsg.html" ]; then
+            META_VERSION=$(grep -oP 'name="version"\s+content="\K[^"]+' "$ROOT/scsg.html" | head -n 1 || true)
+            if [ -n "$META_VERSION" ]; then
+              VERSION="v${META_VERSION}"
+              SOURCE="scsg.html <meta name=\"version\">"
+            fi
+          fi
+
+          # Priority 4 — first ## [X.Y.Z] heading in CHANGELOG.md
+          if [ -z "$VERSION" ]; then
+            CHANGELOG_FILE=""
+            if [ -f "$ROOT/CHANGELOG.md" ]; then
+              CHANGELOG_FILE="$ROOT/CHANGELOG.md"
+            elif [ -f "$ROOT/docs/CHANGELOG.md" ]; then
+              CHANGELOG_FILE="$ROOT/docs/CHANGELOG.md"
+            fi
+            if [ -n "$CHANGELOG_FILE" ]; then
+              CL_VERSION=$(grep -oP '^## \[\K[0-9]+\.[0-9]+\.[0-9]+' "$CHANGELOG_FILE" | head -n 1 || true)
+              if [ -n "$CL_VERSION" ]; then
+                VERSION="v${CL_VERSION}"
+                SOURCE="CHANGELOG.md"
+              fi
+            fi
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from input, tag, scsg.html, or CHANGELOG.md."
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' does not match vMAJOR.MINOR.PATCH (e.g., v1.1.0)."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (from ${SOURCE})"
+
+      # ----------------------------------------------------------------
+      # 4. Pre-flight: required files + version consistency across archive
+      # ----------------------------------------------------------------
+      - name: Pre-flight sanity and version consistency check
+        env:
+          ROOT: ${{ steps.extract.outputs.root }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+
+          for required in scsg.html assets/scsg.css assets/scsg.js LICENSE PRIVACY.md README.md; do
+            if [ ! -e "$ROOT/$required" ]; then
+              echo "::error::Required file missing in archive: $required"
+              exit 1
+            fi
+          done
+
+          CHANGELOG_FILE=""
+          if [ -f "$ROOT/CHANGELOG.md" ]; then
+            CHANGELOG_FILE="$ROOT/CHANGELOG.md"
+          elif [ -f "$ROOT/docs/CHANGELOG.md" ]; then
+            CHANGELOG_FILE="$ROOT/docs/CHANGELOG.md"
+          else
+            echo "::error::CHANGELOG.md not found."
+            exit 1
+          fi
+
+          # License sanity — informational only
+          if ! grep -qi "MIT" "$ROOT/LICENSE"; then
+            echo "::warning::LICENSE does not appear to mention MIT."
+          fi
+
+          # Version consistency — scsg.html and CHANGELOG.md must agree,
+          # and both must agree with the target version.
+          VERSION_NO_V="${VERSION#v}"
+          HTML_VERSION=$(grep -oP 'name="version"\s+content="\K[^"]+' "$ROOT/scsg.html" | head -n 1 || true)
+          CL_VERSION=$(grep -oP '^## \[\K[0-9]+\.[0-9]+\.[0-9]+' "$CHANGELOG_FILE" | head -n 1 || true)
+
+          if [ -n "$HTML_VERSION" ] && [ -n "$CL_VERSION" ] && [ "$HTML_VERSION" != "$CL_VERSION" ]; then
+            echo "::error::Version mismatch: scsg.html says '$HTML_VERSION', CHANGELOG.md says '$CL_VERSION'."
+            exit 1
+          fi
+
+          if [ -n "$HTML_VERSION" ] && [ "$VERSION_NO_V" != "$HTML_VERSION" ]; then
+            echo "::error::Version mismatch: target is '$VERSION', but scsg.html says '$HTML_VERSION'."
+            echo "::error::Refusing to release mislabeled content. Update scsg.html or correct the target version."
+            exit 1
+          fi
+
+          if [ -n "$CL_VERSION" ] && [ "$VERSION_NO_V" != "$CL_VERSION" ]; then
+            echo "::error::Version mismatch: target is '$VERSION', but CHANGELOG.md top entry is '$CL_VERSION'."
+            echo "::error::Refusing to release mislabeled content. Update CHANGELOG.md or correct the target version."
+            exit 1
+          fi
+
+          echo "Version consistency OK: $VERSION (scsg.html=$HTML_VERSION, CHANGELOG.md=$CL_VERSION)"
+
+      # ----------------------------------------------------------------
+      # 5. Extract release notes from CHANGELOG.md for this version
+      # ----------------------------------------------------------------
+      - name: Extract release notes
+        env:
+          ROOT: ${{ steps.extract.outputs.root }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          VERSION_NO_V="${VERSION#v}"
+
+          CHANGELOG_FILE=""
+          if [ -f "$ROOT/CHANGELOG.md" ]; then
+            CHANGELOG_FILE="$ROOT/CHANGELOG.md"
+          elif [ -f "$ROOT/docs/CHANGELOG.md" ]; then
+            CHANGELOG_FILE="$ROOT/docs/CHANGELOG.md"
+          fi
+
+          : > release_notes.md
+          if [ -n "$CHANGELOG_FILE" ]; then
+            awk -v ver="$VERSION_NO_V" '
+              BEGIN { p=0 }
+              $0 ~ "^## \\[" ver "\\]" { p=1; next }
+              p && /^## \[/ { exit }
+              p { print }
+            ' "$CHANGELOG_FILE" > release_notes.md
+          fi
+
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::No release notes found for $VERSION in CHANGELOG.md."
+            echo "See \`CHANGELOG.md\` inside the archive for what changed in this version." > release_notes.md
+          fi
+
+          echo "----- BEGIN RELEASE NOTES -----"
+          cat release_notes.md
+          echo "----- END RELEASE NOTES -----"
+
+      # ----------------------------------------------------------------
+      # 6. Build developer archive deterministically
+      # ----------------------------------------------------------------
+      - name: Build developer archive
+        id: build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          set -e
+          OUT_NAME="scsg-${VERSION}"
+
+          mkdir -p "dist/${OUT_NAME}"
+          rsync -a \
+            --exclude='.git/' --exclude='dist/' --exclude='work/' --exclude='__MACOSX/' \
+            --exclude='backups/*.json' --exclude='node_modules/' \
+            --exclude='.vscode/' --exclude='.idea/' --exclude='.DS_Store' \
+            --exclude='Thumbs.db' --exclude='desktop.ini' --exclude='*.zip' --exclude='*.log' \
+            "$ROOT/" "dist/${OUT_NAME}/"
+
+          # Build metadata for traceability
+          {
+            echo "SCSG ${VERSION}"
+            echo "https://github.com/${{ github.repository }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Runner: ${{ runner.os }} / ${{ runner.arch }}"
+            echo "Node:   $(node --version 2>/dev/null || echo 'unknown')"
+          } > "dist/${OUT_NAME}/VERSION.txt"
+
+          # Deterministic zip: fixed mtime from commit, strip extra attrs.
+          SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          find dist -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+          (cd dist && TZ=UTC zip -Xrq "${OUT_NAME}.zip" "${OUT_NAME}")
+
+          # Sanity: enough files were packaged
+          FILE_COUNT=$(find "dist/${OUT_NAME}" -type f | wc -l)
+          if [ "$FILE_COUNT" -lt 6 ]; then
+            echo "::error::Archive contains only $FILE_COUNT files, expected at least 6."
+            exit 1
+          fi
+          echo "Packaged $FILE_COUNT files into dist/${OUT_NAME}.zip"
+
+          SHA256=$(sha256sum "dist/${OUT_NAME}.zip" | awk '{print $1}')
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA256"
+
+          # Publish checksums file alongside the archive
+          (cd dist && sha256sum "${OUT_NAME}.zip" > checksums.txt)
+          cat dist/checksums.txt
+
+      # ----------------------------------------------------------------
+      # 7. Upload workflow artefacts (30-day retention for triage)
+      # ----------------------------------------------------------------
+      - name: Upload workflow artefacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: scsg-archives-${{ steps.version.outputs.version }}
+          path: |
+            dist/scsg-*.zip
+            dist/checksums.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      # ----------------------------------------------------------------
+      # 8. Duplicate-release guard
+      #    Tag push + existing release → fail (immutable-tag contract)
+      #    Dispatch + existing release → warn (allows retroactive fix)
+      # ----------------------------------------------------------------
+      - name: Guard against duplicate release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          if gh release view "$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+            if [ "$EVENT_NAME" = "push" ]; then
+              echo "::error::Release $VERSION already exists. Tag pushes are idempotent and will not overwrite existing releases."
+              echo "::error::To re-release, use workflow_dispatch with the same version."
+              exit 1
+            else
+              echo "::warning::Release $VERSION already exists. This manual dispatch will overwrite it."
+            fi
+          else
+            echo "No existing release for $VERSION."
+          fi
+
+      # ----------------------------------------------------------------
+      # 9. Ensure the release tag exists (create for dispatch flows)
+      # ----------------------------------------------------------------
+      - name: Ensure release tag exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q "refs/tags/${VERSION}$"; then
+            echo "Tag ${VERSION} already exists on origin."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${VERSION}" -m "SCSG ${VERSION}"
+          git push origin "${VERSION}"
+          echo "Created and pushed tag ${VERSION}."
+
+      # ----------------------------------------------------------------
+      # 10. Assemble release body from template + extracted notes
+      # ----------------------------------------------------------------
+      - name: Build release body
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "**SCSG — Simple Clinic Schedule Generator**"
+            echo "Version \`$VERSION\`"
+            echo ""
+            echo "## Downloads"
+            echo ""
+            echo "| File | SHA256 | Who it's for |"
+            echo "|---|---|---|"
+            echo "| \`scsg-$VERSION.zip\` | \`$SHA256\` | **Developers & forks.** Full source, docs, license, workflow. |"
+            echo "| \`checksums.txt\` | — | SHA256 verification for the archive. |"
+            echo ""
+            echo "## What's New"
+            echo ""
+            cat release_notes.md
+            echo ""
+            echo "## Privacy"
+            echo ""
+            echo "SCSG runs entirely in your browser. It sends **no** data anywhere."
+            echo "See \`PRIVACY.md\` inside the archive."
+            echo ""
+            echo "---"
+            echo ""
+            echo "Source: [\`$REPO\`](https://github.com/$REPO)"
+          } > release_body.md
+
+      # ----------------------------------------------------------------
+      # 11. Publish the release
+      # ----------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: SCSG ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body_path: release_body.md
+          files: |
+            dist/scsg-*.zip
+            dist/checksums.txt
+
+      # ----------------------------------------------------------------
+      # 12. Job summary (visible on the Actions run page)
+      # ----------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE: ${{ steps.version.outputs.source }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          ARCHIVE: ${{ steps.locate.outputs.archive }}
+          ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          {
+            echo "## SCSG Release Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION:-—}\` |"
+            echo "| Source | ${SOURCE:-—} |"
+            echo "| Input archive | \`${ARCHIVE:-—}\` |"
+            echo "| Project root | \`${ROOT:-—}\` |"
+            echo "| SHA256 | \`${SHA256:-—}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
