@@ -3,7 +3,7 @@
 # Release Workflow (Developer Release Only)
 # ----------------------------------------------------------------------------
 # File    : .github/workflows/main.yml
-# Version : 1.1.0
+# Version : 1.2.0
 #
 # AUTHOR  : Richard Korbla Adzido
 # LICENSE : MIT (see LICENSE inside the source archive)
@@ -17,8 +17,13 @@
 #
 # Runtime: all actions pinned to Node.js 24-compatible majors
 #   - actions/checkout@v6            (Node 24)
+#   - actions/setup-node@v4          (Node 24)
 #   - actions/upload-artifact@v6     (Node 24)
 #   - softprops/action-gh-release@v3 (Node 24)
+#
+# NOTE: version detection uses GNU grep's `-oP` (PCRE). This workflow is
+# pinned to `ubuntu-latest`; do not move it to a macOS runner without
+# switching to `grep -oE` or a portable parser.
 # ============================================================================
 
 name: Release
@@ -30,7 +35,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Optional: version override (e.g. v1.1.0). Leave empty to auto-detect from the archive.'
+        description: 'Optional: version override (e.g. v1.2.0). Leave empty to auto-detect from the archive.'
         required: false
         type: string
         default: ''
@@ -44,8 +49,13 @@ permissions:
   contents: write
 
 # One release per version at a time. Never cancel — queue.
+#
+# The group keys on the resolved version when available, falling back to the
+# branch/tag ref. This ensures a manual dispatch for `v1.2.0` and a tag push
+# for `v1.2.0` serialize against each other instead of racing the duplicate-
+# release guard. See `ref_name` on tag pushes = the tag name.
 concurrency:
-  group: release-${{ github.ref }}-${{ github.event.inputs.version }}
+  group: release-${{ github.event.inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -57,7 +67,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
+          # Only the tip commit is needed: SOURCE_DATE_EPOCH is derived from
+          # `git log -1 --pretty=%ct`, which works with a shallow clone.
           fetch-depth: 1
+
+      # ----------------------------------------------------------------
+      # 0. Pin Node.js so `node --check` / `node --test` don't depend on
+      #    the runner image's default runtime.
+      # ----------------------------------------------------------------
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       # ----------------------------------------------------------------
       # 1. Locate the source ZIP
@@ -108,8 +129,8 @@ jobs:
           chmod -R u+rwX work || true
 
           rm -rf work/__MACOSX 2>/dev/null || true
-          find work -type f -name '.DS_Store'   -delete 2>/dev/null || true
-          find work -type f -name 'Thumbs.db'   -delete 2>/dev/null || true
+          find work -type f -name '.DS_Store' -delete 2>/dev/null || true
+          find work -type f -name 'Thumbs.db' -delete 2>/dev/null || true
 
           FOUND=$(find work -type f -name 'scsg.html' 2>/dev/null | head -n 1)
           if [ -z "$FOUND" ]; then
@@ -179,7 +200,7 @@ jobs:
           fi
 
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Version '$VERSION' does not match vMAJOR.MINOR.PATCH (e.g., v1.1.0)."
+            echo "::error::Version '$VERSION' does not match vMAJOR.MINOR.PATCH (e.g., v1.2.0)."
             exit 1
           fi
 
@@ -245,7 +266,22 @@ jobs:
           echo "Version consistency OK: $VERSION (scsg.html=$HTML_VERSION, CHANGELOG.md=$CL_VERSION)"
 
       # ----------------------------------------------------------------
-      # 5. Extract release notes from CHANGELOG.md for this version
+      # 5. Run the scheduling regression suite before publishing
+      # ----------------------------------------------------------------
+      - name: Run scheduling regression tests
+        env:
+          ROOT: ${{ steps.extract.outputs.root }}
+        run: |
+          set -e
+          node --check "$ROOT/assets/scsg.js"
+          if [ ! -f "$ROOT/tests/scheduling-regression.test.js" ]; then
+            echo "::error::Scheduling regression suite is missing from the archive."
+            exit 1
+          fi
+          (cd "$ROOT" && node --test tests/scheduling-regression.test.js)
+
+      # ----------------------------------------------------------------
+      # 6. Extract release notes from CHANGELOG.md for this version
       # ----------------------------------------------------------------
       - name: Extract release notes
         env:
@@ -282,7 +318,7 @@ jobs:
           echo "----- END RELEASE NOTES -----"
 
       # ----------------------------------------------------------------
-      # 6. Build developer archive deterministically
+      # 7. Build developer archive deterministically
       # ----------------------------------------------------------------
       - name: Build developer archive
         id: build
@@ -299,6 +335,7 @@ jobs:
             --exclude='backups/*.json' --exclude='node_modules/' \
             --exclude='.vscode/' --exclude='.idea/' --exclude='.DS_Store' \
             --exclude='Thumbs.db' --exclude='desktop.ini' --exclude='*.zip' --exclude='*.log' \
+            --exclude='release_notes.md' --exclude='release_body.md' \
             "$ROOT/" "dist/${OUT_NAME}/"
 
           # Build metadata for traceability
@@ -316,10 +353,14 @@ jobs:
           find dist -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
           (cd dist && TZ=UTC zip -Xrq "${OUT_NAME}.zip" "${OUT_NAME}")
 
-          # Sanity: enough files were packaged
+          # Sanity: enough files were packaged. The expected set is:
+          #   scsg.html, assets/{scsg.css,scsg.js,fixes.js,primer.txt},
+          #   tests/scheduling-regression.test.js, docs/CHANGELOG.md,
+          #   LICENSE, PRIVACY.md, README.md, VERSION.txt  → 11 files.
+          # Use 8 as the floor so a partial extraction trips the check.
           FILE_COUNT=$(find "dist/${OUT_NAME}" -type f | wc -l)
-          if [ "$FILE_COUNT" -lt 6 ]; then
-            echo "::error::Archive contains only $FILE_COUNT files, expected at least 6."
+          if [ "$FILE_COUNT" -lt 8 ]; then
+            echo "::error::Archive contains only $FILE_COUNT files, expected at least 8."
             exit 1
           fi
           echo "Packaged $FILE_COUNT files into dist/${OUT_NAME}.zip"
@@ -333,7 +374,7 @@ jobs:
           cat dist/checksums.txt
 
       # ----------------------------------------------------------------
-      # 7. Upload workflow artefacts (30-day retention for triage)
+      # 8. Upload workflow artefacts (30-day retention for triage)
       # ----------------------------------------------------------------
       - name: Upload workflow artefacts
         uses: actions/upload-artifact@v6
@@ -346,7 +387,7 @@ jobs:
           if-no-files-found: error
 
       # ----------------------------------------------------------------
-      # 8. Duplicate-release guard
+      # 9. Duplicate-release guard
       #    Tag push + existing release → fail (immutable-tag contract)
       #    Dispatch + existing release → warn (allows retroactive fix)
       # ----------------------------------------------------------------
@@ -364,14 +405,34 @@ jobs:
               echo "::error::To re-release, use workflow_dispatch with the same version."
               exit 1
             else
-              echo "::warning::Release $VERSION already exists. This manual dispatch will overwrite it."
+              echo "::warning::Release $VERSION already exists. This manual dispatch will replace it."
             fi
           else
             echo "No existing release for $VERSION."
           fi
 
       # ----------------------------------------------------------------
-      # 9. Ensure the release tag exists (create for dispatch flows)
+      # 10. Dispatch-only cleanup: delete the existing release before
+      #     re-creating it. `softprops/action-gh-release` merges assets
+      #     rather than replacing them, so without this step a rerun
+      #     would leave stale assets behind. The tag is preserved.
+      # ----------------------------------------------------------------
+      - name: Delete existing release (dispatch rerun only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if gh release view "$VERSION" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Deleting existing release $VERSION (tag preserved)."
+            gh release delete "$VERSION" --repo "${{ github.repository }}" --yes --cleanup-tag=false || true
+          else
+            echo "No existing release to delete."
+          fi
+
+      # ----------------------------------------------------------------
+      # 11. Ensure the release tag exists (create for dispatch flows)
       # ----------------------------------------------------------------
       - name: Ensure release tag exists
         env:
@@ -387,11 +448,22 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git tag -a "${VERSION}" -m "SCSG ${VERSION}"
-          git push origin "${VERSION}"
-          echo "Created and pushed tag ${VERSION}."
+
+          # The ls-remote check above can race with an external push. If the
+          # push fails but the tag now exists, treat it as success.
+          if ! git push origin "${VERSION}" 2>/dev/null; then
+            if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q "refs/tags/${VERSION}$"; then
+              echo "Tag ${VERSION} appeared concurrently; proceeding."
+            else
+              echo "::error::Failed to push tag ${VERSION}."
+              exit 1
+            fi
+          else
+            echo "Created and pushed tag ${VERSION}."
+          fi
 
       # ----------------------------------------------------------------
-      # 10. Assemble release body from template + extracted notes
+      # 12. Assemble release body from template + extracted notes
       # ----------------------------------------------------------------
       - name: Build release body
         env:
@@ -425,7 +497,7 @@ jobs:
           } > release_body.md
 
       # ----------------------------------------------------------------
-      # 11. Publish the release
+      # 13. Publish the release
       # ----------------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -442,7 +514,7 @@ jobs:
             dist/checksums.txt
 
       # ----------------------------------------------------------------
-      # 12. Job summary (visible on the Actions run page)
+      # 14. Job summary (visible on the Actions run page)
       # ----------------------------------------------------------------
       - name: Write job summary
         if: always()
