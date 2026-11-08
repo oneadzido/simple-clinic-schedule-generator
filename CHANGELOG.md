@@ -1,11 +1,100 @@
 # Changelog
 
+## Current scheduling requirements
+
+- Support staff are assigned Night duty on Sundays only when Sunday is a working day. If Sunday is configured as an off-day, the staff member remains off for the full day to attend church.
+- Nursing off-days must be preceded by a Morning (`M`) shift within the generated month. The generator reserves these Morning assignments before distributing other shift types, then validates all coverage requirements.
+- Implemented invariants are numbered contiguously INV1–INV7. There are no unspecified invariant identifiers.
+
 All notable changes to **SCSG — Simple Clinic Schedule Generator**.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
 **Author:** Richard Korbla Adzido
+
+---
+
+## [1.2.0] — 2026-11-08
+
+This release refactors the default scheduling path around complete invariant
+compliance and measurable shift fairness, and consolidates the implemented
+invariants into a contiguous INV1–INV7 sequence.
+
+### Fixed
+- **Per-shift fairness:** nursing candidates are selected using persistent,
+  non-decaying historical counts for the specific shift being assigned (M, A,
+  or N), rather than total duty count alone. General workload counters continue
+  to decay for new-staff fairness without erasing nursing rotation history.
+- **Morning-before-off:** nurses with an off-day tomorrow are reserved for
+  Morning during initial assignment, avoiding post-generation swaps that could
+  remove required Afternoon coverage.
+- **Weekly off-day safety:** default nursing off-days rotate one weekday per
+  week through capacity-compatible Tue–Sat (8h) or Tue–Fri (12h) choices. This
+  avoids Monday/Sunday off-days and rotates weekday/weekend rest fairly.
+- **Capacity validation:** the preflight check now simulates weekly off-day
+  allocation, checks daily minimum nurse coverage, and verifies that required
+  Morning-before-off assignments fit the available Morning slots.
+- **Sunday fairness:** Sunday Morning balancing uses cumulative historical
+  counts and preserves mandatory pre-off Morning assignments. 8-hour repairs
+  may exchange Morning/Afternoon or Night/Afternoon while preserving coverage.
+- **Export safety:** every implemented invariant is export-blocking, including
+  General night eligibility (INV4) and Sunday Morning fairness (INV7).
+- **UI accuracy:** the invariant panel now describes the actual 8-hour and
+  12-hour night floors, off-day policy, and General night eligibility scope.
+
+### Changed
+- **Invariant renumbering:** consolidated the implemented checks into a
+  contiguous INV1–INV7 sequence. Rename only — no behavior change. Mapping:
+  old INV6 → INV5 (off-day count), old INV7 → INV6 (Sunday support Night),
+  old INV8 → INV7 (Sunday Morning fairness). INV1–INV4 are unchanged. The
+  previously referenced but unspecified INV5 / INV9 / INV10 identifiers are
+  retired.
+
+### Verification
+- Both default staff configurations passed all implemented invariants for 122
+  consecutive months (November 2026–December 2036) with the application's
+  cross-month state, 0.5 workload-counter decay, and persistent nursing
+  rotation counters. Both defaults passed without any repair passes.
+- Default-roster maximum consecutive work streak: 7 days under the rotating
+  weekday cycle.
+- Across the 122-month run, each nurse's per-shift totals differed by at most 2
+  within a system. Sunday Morning counts differed by at most 1, and each nurse's
+  off-day weekday counts differed by at most 1 within the eligible weekday cycle.
+- Identical inputs and seeds produce identical schedules.
+
+### Specification notes
+- The renumbered INV1–INV7 suite is fully specified and verified; no unverified
+  invariant identifiers remain.
+- Exactly one off-day in each seven-day week is incompatible with a hard
+  five-consecutive-workday maximum while also rotating weekdays. INV5 is
+  retained; the default rotation guarantees no more than seven consecutive
+  workdays. A stricter cap requires additional rest days or a revised INV5.
+
+## [1.1.1] — 2026-11-04
+
+This release aligns schedule validation, generation diagnostics, and project
+reference material with the current scheduling engine.
+
+### Changed
+- **Generation retry handling:** the scheduler allows up to 50 seeded attempts
+  before declining to export a schedule that still has blocking violations.
+- **Final validation:** unresolved night coverage (INV1), day coverage (INV2),
+  or off-day-count fairness (the invariant now numbered INV5) violations
+  prevent schedule export.
+- **Repair budget:** invariant repair uses up to 5 primary repair passes and a
+  maximum of 500 repair iterations, followed by emergency night-floor handling
+  when required.
+- **Configuration compatibility:** `.scsg` remains the preferred backup
+  extension; imports accept both `.scsg` and `.json` configuration files.
+- **Documentation:** the README and privacy policy describe the current local
+  storage model, continuity state, export formats, validation gates, and
+  project layout.
+
+### Implementation reference
+- Scheduler source: `assets/scsg.js` (source header version 1.1.1).
+- The version displayed in the application footer is read from the `version`
+  metadata in `scsg.html`; keep that metadata synchronized for release builds.
 
 ---
 

@@ -2,8 +2,8 @@
 
 **SCSG — Simple Clinic Schedule Generator**  
 **Author:** Richard Korbla Adzido  
-**Version:** 1.1.0  
-**Last updated:** 2026-10-31  
+**Version:** 1.2.0 (scheduler source)  
+**Last updated:** 2026-11-08  
 
 ---
 
@@ -30,7 +30,7 @@ name, location, or individual staff name is embedded in this source code.
 |---|---|---|
 | Staff names, roles, off-days, night toggle | Your browser's `localStorage` | Only you, on your device |
 | Target month / year, output format, clinic name | Your browser's `localStorage` | Only you, on your device |
-| Cross-month scheduling continuity state (last shift, consecutive working days, duty counters, off-day debt) | Your browser's `localStorage` | Only you, on your device |
+| Cross-month scheduling continuity state (last shift, consecutive working days, duty counters, off-day debt, Sunday Morning counts, nursing rotation counters) | Your browser's `localStorage` | Only you, on your device |
 | Generated PDF / XLSX schedules | Wherever you save the download | Only you |
 | Exported JSON backup | Wherever you save the download | Only you |
 
@@ -55,17 +55,18 @@ client-side using standard browser APIs (`TextEncoder`, `Blob`,
 All configuration is persisted in your browser's `localStorage`:
 
 - **`clinicRosterState`** — the current clinic name, shift system, target
-  month/year, output format, and the full staff list (names, roles,
-  off-days, night-eligibility).
+  month/year, output format, per-role off-day limits, and the full staff
+  list (names, roles, off-days, night-eligibility).
 - **`<schedule>_scsg_state`** — derived per-month scheduling continuity
   state, one entry per successfully generated schedule. Each entry is
   keyed to a specific clinic + shift system + month (e.g.
   `simple_clinic_12h_schedule_december_2026_scsg_state`) and carries only
   the shift bookkeeping the scheduler needs to chain into the following
   month — last shift per staff member, consecutive working days, duty
-  counters, and outstanding off-day debt. It contains **no data beyond
-  what you have already entered**; it is a summary of what the scheduler
-  computed from that data.
+  counters, non-decaying nursing rotation counters, Sunday Morning counts,
+  and outstanding off-day debt. It contains **no data beyond what you have
+  already entered**; it is a summary of what the scheduler computed from
+  that data.
 
 Both key families are scoped to your browser profile and page origin. You
 can delete them at any time by clearing your browser's site data or using
@@ -74,17 +75,18 @@ the app's internal reset buttons.
 > ⚠️ Clearing browser history/data will wipe your configuration. Use
 > **Export Configuration** regularly to keep a JSON backup.
 
-The exported `.scsg` backup is a plain JSON file containing exactly the
-state that lives under `clinicRosterState` — nothing else. Chained
-`_scsg_state` entries are a derived artifact and are intentionally **not**
-part of the backup; they regenerate naturally the next time you generate
-the corresponding month.
+The exported `.scsg` backup is a JSON file containing the current application
+configuration, wrapped in `format`, `version`, and `exportedAt` metadata. The
+configuration state is stored under `clinicRosterState`; the wrapper metadata is
+added for the exported file. Chained `_scsg_state` entries are a derived
+artifact and are intentionally **not** part of the backup; they regenerate
+naturally the next time you generate the corresponding month.
 
 No scheduling bookkeeping is retained beyond the fields listed above. In
 particular, the app does **not** accumulate an off-day history log or a
 consecutive-days streak log — earlier releases tracked these internally but
-they were removed in 1.1.0 because nothing read them. Neither was ever
-exported.
+they were removed in 1.1.0 because nothing read them. Neither is included in
+the configuration export.
 
 ## 4. Default staff roster
 
@@ -113,10 +115,11 @@ automatically.
 3. **Export** — you may download the current configuration as a `.scsg`
    file at any time via **Export Configuration**. The file stays on your
    device.
-4. **Deletion** — click **Remove All Staff** and clear the clinic name,
-   or clear the browser's site data, to reset. There is no "server-side"
-   copy to delete because none exists.
+4. **Deletion** — use **Remove All Staff** to clear the roster, and clear
+   the clinic name and other settings as needed; alternatively, clear the
+   browser's site data for the page. There is no server-side copy to delete.
 
 ## 6. Contact
 
-Have questions about this policy? Contact the developer: **Richard Korbla Adzido** (Email: oneadzido@gmail.com).
+Have questions about this policy? Contact the developer: 
+**Richard Korbla Adzido** (Email: oneadzido@gmail.com).
